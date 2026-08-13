@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+"""sshclip — wrapper de ssh que traduce OSC 52 al portapapeles X11 local.
+
+Terminator (VTE 0.70) no soporta OSC 52, asi que las apps remotas que copian
+por esa via (Claude Code / opencode en modo TUI fullscreen) no llegan al
+portapapeles. Este wrapper corre ssh dentro de una PTY, intercepta las
+secuencias OSC 52 de escritura, las quita del flujo antes de pintarlo y manda
+el contenido decodificado a CLIPBOARD con xclip/xsel.
+
+Uso: igual que ssh.
+    sshclip cyxpc-b
+    sshclip -p 2222 ar@192.168.100.35
+
+Solo remoto -> local: las consultas OSC 52 (lectura del portapapeles) se
+descartan sin responder.
+"""
+
+import base64
+import errno
+import fcntl
+import os
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+SSH = "/usr/bin/ssh"
+
+MAX_PAYLOAD = 1 << 20  # 1 MiB de bytes decodificados
+MAX_B64 = (MAX_PAYLOAD // 3 + 2) * 4  # el base64 correspondiente, con margen
+MAX_PARAM = 8  # digitos de parametro OSC antes de descartar la hipotesis "52"
+MAX_TARGET = 16  # longitud del campo Pc de OSC 52
+
+BEL = 0x07
+ESC = 0x1B
+CAN = 0x18
+SUB = 0x1A
+ST8 = 0x9C  # ST de 8 bits
+
+S_TEXT, S_ESC, S_PARAM, S_OSC_PASS, S_TARGET, S_DATA = range(6)
+
+VALID_TARGETS = set(b"cpqs01234567")
+
+
+class Osc52Filter:
+    """Maquina de estados incremental: separa OSC 52 del resto de la salida.
+
+    feed(chunk) -> (bytes_a_pintar, [payloads_para_el_portapapeles])
+
+    Todo lo que no sea un OSC 52 de escritura pasa intacto, incluidas las
+    secuencias partidas entre lecturas: lo indeciso se retiene en self.held
+    hasta poder resolverlo.
+    """
+
+    def __init__(self):
+        self.state = S_TEXT
+        self.held = bytearray()  # bytes retenidos mientras no sabemos si son OSC 52
+        self.param = bytearray()
+        self.target = bytearray()
+        self.data = bytearray()
+        self.overflow = False
+        self.esc_pending = False  # dentro de OSC: vimos ESC, esperamos '\'
+
+    # -- helpers -----------------------------------------------------------
+
+    def _reset(self):
+        self.state = S_TEXT
+        self.held.clear()
+        self.param.clear()
+        self.target.clear()
+        self.data.clear()
+        self.overflow = False
+        self.esc_pending = False
+
+    def _finish_52(self, out, payloads):
+        """Cierra un OSC 52 capturado y, si es valido, encola el payload."""
+        target = bytes(self.target)
+        data = bytes(self.data)
+        overflow = self.overflow
+        self._reset()
+
+        if overflow:
+            _dbg("rechazo: overflow (>1 MiB)")
+            return  # mas de 1 MiB: se descarta entero
+        if data == b"?":
+            _dbg("rechazo: consulta de lectura")
+            return  # consulta de lectura: nunca se responde
+        if target and not set(target) <= VALID_TARGETS:
+            _dbg("rechazo: Pc invalido %r" % target[:32])
+            return
+        payload = _b64_decode(data)
+        if payload is None:
+            _dbg("rechazo: base64 invalido (%d bytes de b64)" % len(data))
+            return
+        if len(payload) > MAX_PAYLOAD:
+            _dbg("rechazo: payload de %d bytes" % len(payload))
+            return
+        payloads.append(payload)
+
+    # -- parser ------------------------------------------------------------
+
+    def feed(self, chunk):
+        out = bytearray()
+        payloads = []
+        i = 0
+        n = len(chunk)
+
+        while i < n:
+            b = chunk[i]
+            st = self.state
+
+            if st == S_TEXT:
+                j = chunk.find(b"\x1b", i)
+                if j < 0:
+                    out += chunk[i:]
+                    i = n
+                else:
+                    out += chunk[i:j]
+                    self.held += b"\x1b"
+                    self.state = S_ESC
+                    i = j + 1
+                continue
+
+            if st == S_ESC:
+                if b == ord("]"):
+                    self.held += b"]"
+                    self.param.clear()
+                    self.state = S_PARAM
+                elif b == ESC:
+                    out += self.held  # ESC ESC: el primero es literal
+                    self.held.clear()
+                    self.held += b"\x1b"
+                else:
+                    out += self.held
+                    out.append(b)
+                    self.held.clear()
+                    self.state = S_TEXT
+                i += 1
+                continue
+
+            if st == S_PARAM:
+                if b == ord(";"):
+                    if bytes(self.param) == b"52":
+                        self.held.clear()  # a partir de aqui se traga todo
+                        self.target.clear()
+                        self.data.clear()
+                        self.overflow = False
+                        self.esc_pending = False
+                        self.state = S_TARGET
+                    else:
+                        out += self.held
+                        out.append(b)
+                        self.held.clear()
+                        self.state = S_OSC_PASS
+                    i += 1
+                    continue
+                if 0x30 <= b <= 0x39 and len(self.param) < MAX_PARAM:
+                    self.param.append(b)
+                    self.held.append(b)
+                    i += 1
+                    continue
+                # No es un OSC 52: soltamos lo retenido y reprocesamos el byte
+                out += self.held
+                self.held.clear()
+                self.state = S_OSC_PASS
+                continue
+
+            if st == S_OSC_PASS:
+                # OSC ajeno: se pinta tal cual, solo rastreamos donde termina
+                out.append(b)
+                i += 1
+                if self.esc_pending:
+                    self.esc_pending = b == ESC
+                    if not self.esc_pending:
+                        self.state = S_TEXT
+                    continue
+                if b == BEL or b == ST8:
+                    self.state = S_TEXT
+                elif b == ESC:
+                    self.esc_pending = True
+                elif b in (CAN, SUB):
+                    self.state = S_TEXT
+                continue
+
+            if st == S_TARGET:
+                i += 1
+                if self.esc_pending:
+                    self.esc_pending = False
+                    if b == ord("\\"):
+                        self._reset()  # OSC 52 sin datos: se descarta
+                    else:
+                        self._reset()
+                    continue
+                if b == ord(";"):
+                    self.state = S_DATA
+                elif b == ESC:
+                    self.esc_pending = True
+                elif b in (BEL, ST8, CAN, SUB):
+                    self._reset()
+                elif len(self.target) < MAX_TARGET:
+                    self.target.append(b)
+                else:
+                    self._reset()  # Pc absurdamente largo: malformado
+                continue
+
+            if st == S_DATA:
+                i += 1
+                if self.esc_pending:
+                    self.esc_pending = False
+                    if b == ord("\\"):
+                        self._finish_52(out, payloads)
+                    else:
+                        self._reset()  # ESC dentro del payload: aborta
+                    continue
+                if b == BEL or b == ST8:
+                    self._finish_52(out, payloads)
+                elif b == ESC:
+                    self.esc_pending = True
+                elif b in (CAN, SUB):
+                    self._reset()
+                elif len(self.data) < MAX_B64:
+                    self.data.append(b)
+                else:
+                    self.overflow = True  # seguimos consumiendo hasta el final
+                continue
+
+        return bytes(out), payloads
+
+    def flush(self):
+        """Bytes retenidos al cerrar el flujo (secuencia incompleta)."""
+        if self.state in (S_ESC, S_PARAM):
+            held = bytes(self.held)
+            self._reset()
+            return held
+        self._reset()
+        return b""
+
+
+def _b64_decode(data):
+    """Base64 estricto: alfabeto validado, relleno tolerado si falta."""
+    if not data:
+        return b""
+    try:
+        return base64.b64decode(data, validate=True)
+    except Exception:
+        pass
+    pad = (-len(data)) % 4
+    if pad:
+        try:
+            return base64.b64decode(data + b"=" * pad, validate=True)
+        except Exception:
+            return None
+    return None
+
+
+# -- portapapeles ---------------------------------------------------------
+
+
+def _clipboard_cmds():
+    """(comando de escritura, comando de lectura) o (None, None)."""
+    xclip = shutil.which("xclip")
+    if xclip:
+        return (
+            [xclip, "-selection", "clipboard", "-i"],
+            [xclip, "-selection", "clipboard", "-o"],
+        )
+    xsel = shutil.which("xsel")
+    if xsel:
+        return (
+            [xsel, "--input", "--clipboard"],
+            [xsel, "--output", "--clipboard"],
+        )
+    return (None, None)
+
+
+def _dbg(msg):
+    path = os.environ.get("SSHCLIP_DEBUG")
+    if not path:
+        return
+    try:
+        with open(path, "a") as fh:
+            fh.write(msg + "\n")
+    except OSError:
+        pass
+
+
+RETRY_WAITS = (0.08, 0.15, 0.25, 0.40)
+
+
+def _copy(cmds, payload):
+    """Escribe en CLIPBOARD y verifica, reintentando si hace falta.
+
+    xfce4-clipman (el gestor de portapapeles de XFCE) compite por la propiedad
+    de la seleccion y se come la primera escritura mas o menos la mitad de las
+    veces; pasa igual con `xsel -ib` a pelo, sin este wrapper de por medio. Por
+    eso releemos el portapapeles y reintentamos.
+
+    La relectura es puramente local: nada vuelve nunca al lado remoto.
+    """
+    write_cmd, read_cmd = cmds
+    _dbg("copy: %d bytes" % len(payload))
+    if not write_cmd:
+        return
+    for wait in RETRY_WAITS:
+        try:
+            subprocess.run(
+                write_cmd,
+                input=payload,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            return  # el portapapeles nunca debe tumbar la sesion
+        if not read_cmd:
+            return
+        time.sleep(wait)
+        try:
+            got = subprocess.run(
+                read_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            ).stdout
+        except Exception:
+            return
+        # got != payload tambien cuando xsel corta en un NUL: si lo leido es
+        # prefijo de lo enviado, damos la copia por buena.
+        if got and (got == payload or payload.startswith(got)):
+            return
+    _dbg("aviso: el portapapeles no confirmo la copia tras %d intentos" % len(RETRY_WAITS))
+
+
+# -- io -------------------------------------------------------------------
+
+
+def _write_all(fd, data):
+    while data:
+        try:
+            written = os.write(fd, data)
+        except OSError as exc:
+            if exc.errno == errno.EINTR:
+                continue
+            if exc.errno == errno.EAGAIN:
+                select.select([], [fd], [])
+                continue
+            raise
+        data = data[written:]
+
+
+def _copy_winsize(dst_fd):
+    try:
+        size = fcntl.ioctl(pty_ref["stdin"], termios.TIOCGWINSZ, b"\0" * 8)
+    except OSError:
+        size = struct.pack("HHHH", 24, 80, 0, 0)
+    try:
+        fcntl.ioctl(dst_fd, termios.TIOCSWINSZ, size)
+    except OSError:
+        pass
+
+
+pty_ref = {"stdin": 0}
+
+
+def run(args):
+    import pty as _pty
+
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+    pty_ref["stdin"] = stdin_fd
+
+    stdin_is_tty = os.isatty(stdin_fd)
+    saved = termios.tcgetattr(stdin_fd) if stdin_is_tty else None
+
+    clip = _clipboard_cmds()
+    if clip[0] is None:
+        print(
+            "sshclip: no encuentro xclip ni xsel; la sesion sigue, sin portapapeles.",
+            file=sys.stderr,
+        )
+    elif not os.environ.get("DISPLAY"):
+        print("sshclip: DISPLAY vacio; el portapapeles no va a funcionar.", file=sys.stderr)
+
+    pid, master_fd = _pty.fork()
+    if pid == 0:
+        try:
+            os.execv(SSH, [SSH] + args)
+        except OSError as exc:
+            sys.stderr.write("sshclip: no puedo ejecutar %s: %s\n" % (SSH, exc))
+        os._exit(126)
+
+    # Tuberia de despertar: hace que select() salga al recibir una senal.
+    wake_r, wake_w = os.pipe()
+    for fd in (wake_r, wake_w):
+        fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+    signal.set_wakeup_fd(wake_w)
+
+    def _on_signal(signum, frame):
+        pass  # solo despierta el select; la accion va en el bucle
+
+    for sig in (signal.SIGWINCH, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _on_signal)
+
+    _copy_winsize(master_fd)
+
+    filt = Osc52Filter()
+    watch_stdin = True
+
+    try:
+        if stdin_is_tty:
+            tty.setraw(stdin_fd)
+
+        while True:
+            rset = [master_fd, wake_r]
+            if watch_stdin:
+                rset.append(stdin_fd)
+            try:
+                ready, _, _ = select.select(rset, [], [])
+            except (OSError, select.error) as exc:
+                if getattr(exc, "errno", None) == errno.EINTR:
+                    continue
+                raise
+
+            if wake_r in ready:
+                try:
+                    sigs = os.read(wake_r, 1024)
+                except OSError:
+                    sigs = b""
+                for signum in sigs:
+                    if signum == signal.SIGWINCH:
+                        _copy_winsize(master_fd)
+                    elif signum in (signal.SIGTERM, signal.SIGHUP):
+                        try:
+                            os.kill(pid, signum)
+                        except OSError:
+                            pass
+
+            if master_fd in ready:
+                try:
+                    chunk = os.read(master_fd, 65536)
+                except OSError as exc:
+                    if exc.errno == errno.EINTR:
+                        continue
+                    chunk = b""  # EIO = el hijo cerro la pty
+                if not chunk:
+                    break
+                clean, payloads = filt.feed(chunk)
+                if clean:
+                    _write_all(stdout_fd, clean)
+                for payload in payloads:
+                    _copy(clip, payload)
+
+            if watch_stdin and stdin_fd in ready:
+                try:
+                    chunk = os.read(stdin_fd, 65536)
+                except OSError as exc:
+                    if exc.errno == errno.EINTR:
+                        continue
+                    chunk = b""
+                if not chunk:
+                    watch_stdin = False  # EOF local: no cerramos la pty del hijo
+                else:
+                    try:
+                        _write_all(master_fd, chunk)
+                    except OSError:
+                        break
+
+        rest = filt.flush()
+        if rest:
+            try:
+                _write_all(stdout_fd, rest)
+            except OSError:
+                pass
+    finally:
+        signal.set_wakeup_fd(-1)
+        if saved is not None:
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, saved)
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+    _, status = os.waitpid(pid, 0)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return os.WEXITSTATUS(status)
+
+
+def main(argv):
+    args = argv[1:]
+    if args and args[0] == "--selftest":
+        return selftest()
+    if not os.path.exists(SSH):
+        print("sshclip: no existe %s" % SSH, file=sys.stderr)
+        return 127
+    return run(args)
+
+
+# -- pruebas del parser ---------------------------------------------------
+
+
+def selftest():
+    ok = True
+
+    def check(name, condition):
+        nonlocal ok
+        status = "ok  " if condition else "FALLA"
+        if not condition:
+            ok = False
+        print("%s  %s" % (status, name))
+
+    def run_chunks(chunks):
+        f = Osc52Filter()
+        out = bytearray()
+        pays = []
+        for c in chunks:
+            o, p = f.feed(c)
+            out += o
+            pays += p
+        out += f.flush()
+        return bytes(out), pays
+
+    b64 = base64.b64encode(b"hola mundo")
+
+    out, pays = run_chunks([b"antes\x1b]52;c;" + b64 + b"\x07despues"])
+    check("OSC 52 con BEL: se copia", pays == [b"hola mundo"])
+    check("OSC 52 con BEL: se limpia", out == b"antesdespues")
+
+    out, pays = run_chunks([b"a\x1b]52;c;" + b64 + b"\x1b\\b"])
+    check("OSC 52 con ESC-backslash", pays == [b"hola mundo"] and out == b"ab")
+
+    seq = b"x\x1b]52;c;" + b64 + b"\x07y"
+    chunks = [seq[i : i + 1] for i in range(len(seq))]
+    out, pays = run_chunks(chunks)
+    check("fragmentado byte a byte", pays == [b"hola mundo"] and out == b"xy")
+
+    out, pays = run_chunks([b"\x1b]5", b"2;c;" + b64[:4], b64[4:] + b"\x1b", b"\\"])
+    check("cortado en el parametro y en el ST", pays == [b"hola mundo"] and out == b"")
+
+    uni = "ñ é 日本語 🐍".encode()
+    out, pays = run_chunks([b"\x1b]52;c;" + base64.b64encode(uni) + b"\x07"])
+    check("unicode", pays == [uni] and out == b"")
+
+    out, pays = run_chunks([b"\x1b]52;;" + b64 + b"\x07"])
+    check("Pc vacio", pays == [b"hola mundo"])
+
+    out, pays = run_chunks([b"\x1b]52;c;?\x07"])
+    check("consulta de lectura rechazada", pays == [] and out == b"")
+
+    out, pays = run_chunks([b"\x1b]52;c;no-base64!!\x07"])
+    check("base64 invalido rechazado", pays == [])
+
+    big = base64.b64encode(b"z" * (MAX_PAYLOAD + 1))
+    out, pays = run_chunks([b"\x1b]52;c;" + big + b"\x07fin"])
+    check("payload >1 MiB rechazado", pays == [] and out == b"fin")
+
+    limit = base64.b64encode(b"z" * MAX_PAYLOAD)
+    out, pays = run_chunks([b"\x1b]52;c;" + limit + b"\x07"])
+    check("payload de 1 MiB exacto aceptado", pays and len(pays[0]) == MAX_PAYLOAD)
+
+    title = b"\x1b]0;titulo\x07texto"
+    out, pays = run_chunks([title])
+    check("OSC 0 (titulo) intacto", out == title and pays == [])
+
+    out, pays = run_chunks([b"\x1b]520;c;abcd\x07Z"])
+    check("OSC 520 no se confunde con 52", out == b"\x1b]520;c;abcd\x07Z" and pays == [])
+
+    colors = b"\x1b[1;31mrojo\x1b[0m\r\n\x1b[?1049h"
+    out, pays = run_chunks([colors])
+    check("secuencias CSI intactas", out == colors)
+
+    out, pays = run_chunks([b"a\x1b\x1b[Ab"])
+    check("ESC ESC literal", out == b"a\x1b\x1b[Ab")
+
+    out, _ = run_chunks([b"cola\x1b]"])
+    check("secuencia truncada se vuelca al cerrar", out == b"cola\x1b]")
+
+    out, pays = run_chunks([b"\x1b]52;c;" + b64 + b"\x18resto"])
+    check("CAN aborta sin copiar", pays == [] and out == b"resto")
+
+    out, pays = run_chunks(
+        [b"\x1b]52;c;" + b64 + b"\x07 y \x1b]52;p;" + base64.b64encode(b"dos") + b"\x1b\\"]
+    )
+    check("dos secuencias seguidas", pays == [b"hola mundo", b"dos"] and out == b" y ")
+
+    print()
+    print("selftest:", "todo verde" if ok else "hay fallos")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        sys.exit(130)
