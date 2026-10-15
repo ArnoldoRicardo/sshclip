@@ -1,0 +1,409 @@
+{
+  "cases": [
+    {
+      "name": "OSC 52 con BEL: se copia y se limpia",
+      "chunks": [["antes\u001b]52;c;", {"b64": "hola mundo"}, "\u0007despues"]],
+      "out": "antesdespues",
+      "payloads": ["hola mundo"]
+    },
+    {
+      "name": "OSC 52 con ESC-backslash",
+      "chunks": [["a\u001b]52;c;", {"b64": "hola mundo"}, "\u001b\\b"]],
+      "out": "ab",
+      "payloads": ["hola mundo"]
+    },
+    {
+      "name": "fragmentado byte a byte",
+      "chunks": [["x\u001b]52;c;", {"b64": "hola mundo"}, "\u0007y"]],
+      "split": "bytewise",
+      "out": "xy",
+      "payloads": ["hola mundo"]
+    },
+    {
+      "name": "cortado en el parametro y en el ST",
+      "chunks": ["\u001b]5", "2;c;aG9s", "YSBtdW5kbw==\u001b", "\\"],
+      "out": "",
+      "payloads": ["hola mundo"]
+    },
+    {
+      "name": "unicode",
+      "chunks": [["\u001b]52;c;", {"b64": {"utf8": "ñ é 日本語 🐍"}}, "\u0007"]],
+      "out": "",
+      "payloads": [{"utf8": "ñ é 日本語 🐍"}]
+    },
+    {
+      "name": "Pc vacio",
+      "chunks": [["\u001b]52;;", {"b64": "hola mundo"}, "\u0007"]],
+      "out": "",
+      "payloads": ["hola mundo"]
+    },
+    {
+      "name": "consulta de lectura rechazada",
+      "chunks": ["\u001b]52;c;?\u0007"],
+      "out": "",
+      "payloads": []
+    },
+    {
+      "name": "base64 invalido rechazado",
+      "chunks": ["\u001b]52;c;no-base64!!\u0007"],
+      "out": "",
+      "payloads": []
+    },
+    {
+      "name": "payload >1 MiB rechazado",
+      "chunks": [["\u001b]52;c;", {"b64": {"repeat": "z", "times": 1048577}}, "\u0007fin"]],
+      "out": "fin",
+      "payloads": []
+    },
+    {
+      "name": "payload de 1 MiB exacto aceptado",
+      "chunks": [["\u001b]52;c;", {"b64": {"repeat": "z", "times": 1048576}}, "\u0007"]],
+      "out": "",
+      "payloads": [{"repeat": "z", "times": 1048576}]
+    },
+    {
+      "name": "OSC 0 (titulo) intacto",
+      "chunks": ["\u001b]0;titulo\u0007texto"],
+      "out": "\u001b]0;titulo\u0007texto",
+      "payloads": []
+    },
+    {
+      "name": "OSC 520 no se confunde con 52",
+      "chunks": ["\u001b]520;c;abcd\u0007Z"],
+      "out": "\u001b]520;c;abcd\u0007Z",
+      "payloads": []
+    },
+    {
+      "name": "secuencias CSI intactas",
+      "chunks": ["\u001b[1;31mrojo\u001b[0m\r\n\u001b[?1049h"],
+      "out": "\u001b[1;31mrojo\u001b[0m\r\n\u001b[?1049h",
+      "payloads": []
+    },
+    {
+      "name": "ESC ESC literal",
+      "chunks": ["a\u001b\u001b[Ab"],
+      "out": "a\u001b\u001b[Ab",
+      "payloads": []
+    },
+    {
+      "name": "secuencia truncada se vuelca al cerrar",
+      "chunks": ["cola\u001b]"],
+      "out": "cola\u001b]",
+      "payloads": []
+    },
+    {
+      "name": "CAN aborta sin copiar",
+      "chunks": [["\u001b]52;c;", {"b64": "hola mundo"}, "\u0018resto"]],
+      "out": "resto",
+      "payloads": []
+    },
+    {
+      "name": "dos secuencias seguidas",
+      "chunks": [["\u001b]52;c;", {"b64": "hola mundo"}, "\u0007 y \u001b]52;p;", {"b64": "dos"}, "\u001b\\"]],
+      "out": " y ",
+      "payloads": ["hola mundo", "dos"]
+    },
+
+    {
+      "name": "overflow: base64 mayor que MAX_B64 se descarta y lo siguiente sale",
+      "chunks": [["\u001b]52;c;", {"b64": {"repeat": "z", "times": 1048582}}, "\u0007fin"]],
+      "out": "fin",
+      "payloads": []
+    },
+    {
+      "name": "overflow no impide copiar la siguiente secuencia",
+      "chunks": [["\u001b]52;c;", {"repeat": "A", "times": 1400000}, "\u0007\u001b]52;c;aGk=\u0007"]],
+      "out": "",
+      "payloads": ["hi"]
+    },
+    {
+      "name": "Pc con caracter invalido se rechaza",
+      "chunks": [["\u001b]52;x;", {"b64": "hola mundo"}, "\u0007"]],
+      "out": "",
+      "payloads": []
+    },
+    {
+      "name": "Pc con todos los selectores validos",
+      "chunks": ["\u001b]52;cpqs01234567;aGk=\u0007"],
+      "out": "",
+      "payloads": ["hi"]
+    },
+    {
+      "name": "OSC con parametro no numerico pasa intacto",
+      "chunks": ["\u001b]P0ffffffresto"],
+      "out": "\u001b]P0ffffffresto",
+      "payloads": []
+    },
+    {
+      "name": "OSC con letra antes del ; pasa intacto",
+      "chunks": ["\u001b]L;x\u0007Z"],
+      "out": "\u001b]L;x\u0007Z",
+      "payloads": []
+    },
+    {
+      "name": "OSC con parametro vacio pasa intacto",
+      "chunks": ["\u001b];x\u0007Z"],
+      "out": "\u001b];x\u0007Z",
+      "payloads": []
+    },
+    {
+      "name": "OSC 52 seguido de basura antes del ; pasa intacto",
+      "chunks": ["\u001b]52x;aGk=\u0007Z"],
+      "out": "\u001b]52x;aGk=\u0007Z",
+      "payloads": []
+    },
+    {
+      "name": "OSC 052 no es 52 (comparacion de texto, no de numero)",
+      "chunks": ["\u001b]052;c;aGk=\u0007Z"],
+      "out": "\u001b]052;c;aGk=\u0007Z",
+      "payloads": []
+    },
+    {
+      "name": "parametro de mas de 8 digitos pasa intacto",
+      "chunks": ["\u001b]123456789;x\u0007Z"],
+      "out": "\u001b]123456789;x\u0007Z",
+      "payloads": []
+    },
+    {
+      "name": "OSC ajeno cerrado con ESC-backslash",
+      "chunks": ["\u001b]0;titulo\u001b\\texto\u001b]52;c;aGk=\u0007"],
+      "out": "\u001b]0;titulo\u001b\\texto",
+      "payloads": ["hi"]
+    },
+    {
+      "name": "OSC ajeno: ESC + otro byte termina el rastreo",
+      "chunks": ["\u001b]0;t\u001bX\u001b]52;c;aGk=\u0007"],
+      "out": "\u001b]0;t\u001bX",
+      "payloads": ["hi"]
+    },
+    {
+      "name": "OSC ajeno: ESC ESC deja el ST pendiente",
+      "chunks": ["\u001b]0;t\u001b\u001b\\\u001b]52;c;aGk=\u0007"],
+      "out": "\u001b]0;t\u001b\u001b\\",
+      "payloads": ["hi"]
+    },
+    {
+      "name": "OSC ajeno: tras ESC ESC ESC el ] no abre un OSC nuevo",
+      "chunks": ["\u001b]0;t\u001b\u001b\u001b]52;c;aGk=\u0007"],
+      "out": "\u001b]0;t\u001b\u001b\u001b]52;c;aGk=\u0007",
+      "payloads": []
+    },
+    {
+      "name": "OSC ajeno cerrado con ST de 8 bits",
+      "chunks": ["\u001b]0;t\u009c\u001b]52;c;aGk=\u0007"],
+      "out": "\u001b]0;t\u009c",
+      "payloads": ["hi"]
+    },
+    {
+      "name": "OSC ajeno abortado con CAN",
+      "chunks": ["\u001b]0;t\u0018\u001b]52;c;aGk=\u0007"],
+      "out": "\u001b]0;t\u0018",
+      "payloads": ["hi"]
+    },
+    {
+      "name": "OSC ajeno abortado con SUB",
+      "chunks": ["\u001b]0;t\u001a\u001b]52;c;aGk=\u0007"],
+      "out": "\u001b]0;t\u001a",
+      "payloads": ["hi"]
+    },
+    {
+      "name": "OSC ajeno sin cerrar al terminar ya se pinto",
+      "chunks": ["\u001b]0;tit"],
+      "out": "\u001b]0;tit",
+      "payloads": []
+    },
+    {
+      "name": "OSC ajeno y CSI fragmentados byte a byte",
+      "chunks": ["\u001b[1;31mrojo\u001b]0;t\u001b\\fin\u001b\u001b[A"],
+      "split": "bytewise",
+      "out": "\u001b[1;31mrojo\u001b]0;t\u001b\\fin\u001b\u001b[A",
+      "payloads": []
+    },
+    {
+      "name": "OSC 52 sin datos cerrado con ESC-backslash en el Pc",
+      "chunks": ["\u001b]52;\u001b\\resto"],
+      "out": "resto",
+      "payloads": []
+    },
+    {
+      "name": "ESC + otro byte en el Pc aborta y se traga ese byte",
+      "chunks": ["\u001b]52;c\u001bXresto"],
+      "out": "resto",
+      "payloads": []
+    },
+    {
+      "name": "BEL en el Pc descarta la secuencia",
+      "chunks": ["\u001b]52;c\u0007resto"],
+      "out": "resto",
+      "payloads": []
+    },
+    {
+      "name": "ST de 8 bits en el Pc descarta la secuencia",
+      "chunks": ["\u001b]52;c\u009cresto"],
+      "out": "resto",
+      "payloads": []
+    },
+    {
+      "name": "CAN en el Pc descarta la secuencia",
+      "chunks": ["\u001b]52;c\u0018resto"],
+      "out": "resto",
+      "payloads": []
+    },
+    {
+      "name": "SUB en el Pc descarta la secuencia",
+      "chunks": ["\u001b]52;c\u001aresto"],
+      "out": "resto",
+      "payloads": []
+    },
+    {
+      "name": "Pc de 16 bytes exactos se acepta",
+      "chunks": [["\u001b]52;", {"repeat": "c", "times": 16}, ";aGk=\u0007"]],
+      "out": "",
+      "payloads": ["hi"]
+    },
+    {
+      "name": "Pc de 17 bytes: se traga el 17o y el resto se pinta",
+      "chunks": [["\u001b]52;", {"repeat": "c", "times": 17}, ";aGk=\u0007"]],
+      "out": ";aGk=\u0007",
+      "payloads": []
+    },
+    {
+      "name": "ESC + otro byte en los datos aborta y se traga ese byte",
+      "chunks": ["\u001b]52;c;aGk=\u001bZresto"],
+      "out": "resto",
+      "payloads": []
+    },
+    {
+      "name": "SUB en los datos aborta sin copiar",
+      "chunks": ["\u001b]52;c;aGk=\u001aresto"],
+      "out": "resto",
+      "payloads": []
+    },
+    {
+      "name": "OSC 52 cerrado con ST de 8 bits",
+      "chunks": ["\u001b]52;c;aGk=\u009cfin"],
+      "out": "fin",
+      "payloads": ["hi"]
+    },
+    {
+      "name": "OSC 52 con datos vacios copia cadena vacia",
+      "chunks": ["\u001b]52;c;\u0007"],
+      "out": "",
+      "payloads": [""]
+    },
+    {
+      "name": "base64 sin relleno se acepta",
+      "chunks": ["\u001b]52;c;aGk\u0007"],
+      "out": "",
+      "payloads": ["hi"]
+    },
+    {
+      "name": "base64 al que le faltan 2 de relleno se acepta",
+      "chunks": ["\u001b]52;c;aGVsbG8gdw\u0007"],
+      "out": "",
+      "payloads": ["hello w"]
+    },
+    {
+      "name": "base64 con relleno imposible se rechaza",
+      "chunks": ["\u001b]52;c;a\u0007"],
+      "out": "",
+      "payloads": []
+    },
+    {
+      "name": "base64 invalido de longitud multiplo de 4 se rechaza",
+      "chunks": ["\u001b]52;c;!!!!\u0007"],
+      "out": "",
+      "payloads": []
+    },
+    {
+      "name": "base64 con bits sobrantes no canonicos se acepta (aGl= -> hi)",
+      "chunks": ["\u001b]52;c;aGl=\u0007"],
+      "out": "",
+      "payloads": ["hi"]
+    },
+    {
+      "name": "base64 con bits sobrantes y sin relleno se acepta (aGl -> hi)",
+      "chunks": ["\u001b]52;c;aGl\u0007"],
+      "out": "",
+      "payloads": ["hi"]
+    },
+    {
+      "name": "base64 con bits sobrantes y un = se acepta (aGVsbG8gd2= -> hello w)",
+      "chunks": ["\u001b]52;c;aGVsbG8gd2=\u0007"],
+      "out": "",
+      "payloads": ["hello w"]
+    },
+    {
+      "name": "base64 con relleno de mas se rechaza",
+      "chunks": ["\u001b]52;c;aGk==\u0007"],
+      "out": "",
+      "payloads": []
+    },
+    {
+      "name": "base64 con = en medio se rechaza",
+      "chunks": ["\u001b]52;c;aG=k\u0007"],
+      "out": "",
+      "payloads": []
+    },
+    {
+      "name": "base64 concatenado (relleno a mitad) se rechaza",
+      "chunks": ["\u001b]52;c;aGk=aGk=\u0007"],
+      "out": "",
+      "payloads": []
+    },
+    {
+      "name": "base64 solo de relleno se rechaza",
+      "chunks": ["\u001b]52;c;====\u0007"],
+      "out": "",
+      "payloads": []
+    },
+    {
+      "name": "base64 url-safe se rechaza",
+      "chunks": ["\u001b]52;c;-_8=\u0007"],
+      "out": "",
+      "payloads": []
+    },
+    {
+      "name": "base64 con espacio se rechaza",
+      "chunks": ["\u001b]52;c;aGk= \u0007"],
+      "out": "",
+      "payloads": []
+    },
+    {
+      "name": "base64 con salto de linea se rechaza",
+      "chunks": ["\u001b]52;c;aGk=\n\u0007"],
+      "out": "",
+      "payloads": []
+    },
+    {
+      "name": "OSC 52 sin cerrar en el Pc: nada al terminar",
+      "chunks": ["antes\u001b]52;c"],
+      "out": "antes",
+      "payloads": []
+    },
+    {
+      "name": "OSC 52 sin cerrar en los datos: nada al terminar",
+      "chunks": ["antes\u001b]52;c;aGk="],
+      "out": "antes",
+      "payloads": []
+    },
+    {
+      "name": "OSC 52 con ESC final sin cerrar: nada al terminar",
+      "chunks": ["antes\u001b]52;c;aGk=\u001b"],
+      "out": "antes",
+      "payloads": []
+    },
+    {
+      "name": "ESC suelto al final se vuelca al cerrar",
+      "chunks": ["texto\u001b"],
+      "out": "texto\u001b",
+      "payloads": []
+    },
+    {
+      "name": "0x9C en texto plano pasa intacto",
+      "chunks": [["a\u009cb ", {"utf8": "Über"}]],
+      "out": ["a\u009cb ", {"utf8": "Über"}],
+      "payloads": []
+    }
+  ]
+}

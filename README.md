@@ -48,16 +48,59 @@ scp cyxpc-b:~/dev/sshclip/sshclip ~/.local/bin/sshclip && chmod +x ~/.local/bin/
 
 Requisitos: Python 3 (sin dependencias externas), X11, y `xclip` o `xsel`.
 
+### Versión en Rust (`rust/`)
+
+Port del script, byte a byte: un binario estático (musl, ~630 KB) que no necesita
+Python. Por ahora se instala **al lado** del de Python, como `sshclip-rs`, hasta pasar la
+prueba manual del portapapeles.
+
+```sh
+# en cyxpc-b (donde está el repo y cargo)
+cd rust && cargo test && cargo build --release --target x86_64-unknown-linux-musl
+
+# en la laptop
+scp cyxpc-b:~/dev/sshclip/rust/target/x86_64-unknown-linux-musl/release/sshclip ~/.local/bin/sshclip-rs
+sshclip-rs --selftest                                      # los vectores, embebidos
+SSHCLIP_BIN=~/.local/bin/sshclip-rs python3 tests/interactive.py cyxpc-b
+```
+
+`cargo test` y `--selftest` corren el mismo `tests/vectors.json` que la versión de
+Python: es la especificación de las dos. El decodificador base64 replica a Python, que
+acepta bits sobrantes (`aGl=` → `hi`) y relleno faltante; el engine `STANDARD` del crate
+`base64` los rechaza, y hay vectores que lo detectan.
+
+`SSHCLIP_SSH_PATH`, si se define **al compilar**, cambia la ruta de ssh (por defecto
+`/usr/bin/ssh`). Solo sirve para probar la suite interactiva contra un ssh falso; en
+ejecución no hay forma de cambiarla.
+
 ## Pruebas
 
 ```sh
 python3 sshclip --selftest      # 18 pruebas del parser, sin tocar la red
-python3 tests/interactive.py cyxpc-b   # 10 pruebas con PTY real contra un servidor
+python3 tests/parser.py         # 67 vectores del parser (tests/vectors.json)
+python3 tests/interactive.py cyxpc-b   # 14 pruebas con PTY real contra un servidor
 ```
+
+`--selftest` va dentro del script para que `install.sh` pruebe la copia instalada.
+`tests/vectors.json` es la especificación completa del parser, escrita como datos para
+que cualquier implementación (el port de Rust) pase los mismos casos byte a byte. Cubre
+todas las líneas y ramas alcanzables de `Osc52Filter` y `_b64_decode`, incluidos
+comportamientos raros que se fijan tal cual (el byte que se traga un ESC abortado, el Pc
+de más de 16 bytes, el OSC 52 vacío que copia una cadena vacía). El formato está
+documentado en `tests/parser.py`.
 
 Las interactivas comprueban tamaño de ventana inicial, colores intactos, shell
 interactivo, SIGWINCH, `Ctrl+C`, copia OSC 52 real, que la secuencia no se pinte, el
-escape `~.`, el código de salida y que la terminal quede restaurada.
+escape `~.`, el código de salida, que la terminal quede restaurada, SIGTERM, que un EOF
+en stdin no corte la sesión y el 128+n cuando ssh muere por señal. Para probar otro
+binario:
+
+```sh
+SSHCLIP_BIN=./target/release/sshclip python3 tests/interactive.py cyxpc-b
+```
+
+Fuera de las automáticas, y por eso se prueban a mano, quedan los reintentos de `_copy()`
+contra `xfce4-clipman` y la elección entre xclip y xsel.
 
 ## Seguridad
 
